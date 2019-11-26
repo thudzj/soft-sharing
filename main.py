@@ -1,7 +1,9 @@
 from __future__ import division
+from __future__ import print_function
 import os, sys, shutil, time, random
 import argparse
 import torch
+from torch.nn import Parameter
 import torch.backends.cudnn as cudnn
 import torchvision.datasets as dset
 import torchvision.transforms as transforms
@@ -10,6 +12,7 @@ from torch.utils.data.sampler import SubsetRandomSampler
 import models
 import numpy as np
 import random
+from topology import Adjacency
 
 model_names = sorted(name for name in models.__dict__ if name.islower() and not name.startswith("__") and callable(models.__dict__[name]))
 
@@ -49,13 +52,25 @@ parser.add_argument('--workers', type=int, default=2, help='number of data loadi
 # Random seed
 parser.add_argument('--manualSeed', type=int, help='manual seed')
 parser.add_argument('--job-id', type=str, default='')
+
+# Adj setting
+parser.add_argument('--adj_n_components', type=int, default=1, help='# of components in the mixture distribution of adj')
+parser.add_argument('--adj_feature_dim', type=int, default=20, help='dimension of node features to build adj')
+parser.add_argument('--adj_hard', dest='adj_hard', action='store_true', help='whether using hard adj')
+parser.add_argument('--adj_gradient_estimator', type=str, default='gsm', help='gradient estimator to optimize adj')
+parser.add_argument('--tau0', type=float, default=1., help='tau0')
+parser.add_argument('--tau_min', type=float, default=2./3, help='tau_min')
+parser.add_argument('--tau_anneal_rate', type=float, default=0.00003, help='tau_anneal_rate')
+parser.add_argument('--adj_lr', type=float, default=3e-4, help='learning rate for adj')
+parser.add_argument('--entropy_weight', type=float, default=1., help='entropy_weight for adj')
+
 args = parser.parse_args()
 args.use_cuda = args.ngpu > 0 and torch.cuda.is_available()
 job_id = args.job_id
 args.save_path = args.save_path + job_id
 result_png_path = './results/' + job_id + '.png'
 if not os.path.isdir('results'): os.mkdir('results')
-    
+
 out_str = str(args)
 print(out_str)
 
@@ -86,22 +101,25 @@ def load_dataset():
         if args.evaluate:
             train_data = dataset(args.data_path, train=True, transform=train_transform, download=True)
             test_data = dataset(args.data_path, train=False, transform=test_transform, download=True)
-            
+
             train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
             test_loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
         else:
             # partition training set into two instead. note that test_data is defined using train=True
             train_data = dataset(args.data_path, train=True, transform=train_transform, download=True)
-            test_data = dataset(args.data_path, train=True, transform=test_transform, download=True)
+            # test_data = dataset(args.data_path, train=True, transform=test_transform, download=True)
 
-            indices = list(range(len(train_data)))
-            np.random.shuffle(indices)
-            split = int(0.9 * len(train_data))
-            train_indices, test_indices = indices[:split], indices[split:]
-            train_sampler = SubsetRandomSampler(train_indices)
-            test_sampler = SubsetRandomSampler(test_indices)
-            train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-            test_loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, num_workers=args.workers, pin_memory=True, sampler=test_sampler)
+            # indices = list(range(len(train_data)))
+            # np.random.shuffle(indices)
+            # split = int(0.9 * len(train_data))
+            # train_indices, test_indices = indices[:split], indices[split:]
+            # train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, num_workers=args.workers, pin_memory=True, sampler=SubsetRandomSampler(train_indices))
+            # test_loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, num_workers=args.workers, pin_memory=True, sampler=SubsetRandomSampler(test_indices))
+
+            test_data = dataset(args.data_path, train=False, transform=test_transform, download=True)
+            train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, num_workers=args.workers, pin_memory=True, shuffle=True)
+            test_loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
+
 
     elif args.dataset == 'imagenet':
         import imagenet_seq
@@ -142,11 +160,27 @@ def main():
 
     num_classes, train_loader, test_loader = load_dataset()
     net = load_model(num_classes, log)
-    
+
     criterion = torch.nn.CrossEntropyLoss().cuda()
-    
-    params = group_weight_decay(net, state['decay'], ['coefficients'])
+
+    if args.bank_size > 0:
+        coefficients =[
+            Parameter(torch.zeros((net.module.stage_1.nlayers,)+net.module.stage_1.bank.coefficient_shape).cuda()),
+            Parameter(torch.zeros((net.module.stage_2.nlayers,)+net.module.stage_2.bank.coefficient_shape).cuda()),
+            Parameter(torch.zeros((net.module.stage_3.nlayers,)+net.module.stage_3.bank.coefficient_shape).cuda())]
+        for item in coefficients:
+            coefficient_inits = torch.zeros_like(item.data)
+            torch.nn.init.orthogonal_(coefficient_inits)
+            item.data = coefficient_inits
+            # item.data = torch.eye(item.shape[0]).view_as(item).cuda()
+    else:
+        coefficients = None
+    params = group_weight_decay(net, state['decay'], coefficients)
     optimizer = torch.optim.SGD(params, state['learning_rate'], momentum=state['momentum'], nesterov=(state['momentum'] > 0.0))
+
+    adjacency = Adjacency([net.module.stage_1.nlayers+3, net.module.stage_2.nlayers+3, net.module.stage_3.nlayers+3],
+                        args.adj_n_components, args.adj_feature_dim, args.tau0, args.tau_min, args.tau_anneal_rate,
+                        args.adj_hard, args.adj_gradient_estimator, args.adj_lr)
 
     recorder = RecorderMeter(args.epochs)
     if args.resume:
@@ -159,6 +193,8 @@ def main():
             args.start_epoch = checkpoint['epoch']
             net.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
+            coefficients = checkpoint['coefficients']
+            adjacency = checkpoint['adjacency']
             best_acc = recorder.max_accuracy(False)
             print_log("=> loaded checkpoint '{}' accuracy={} (epoch {})" .format(args.resume, best_acc, checkpoint['epoch']), log)
         else:
@@ -167,13 +203,13 @@ def main():
         print_log("=> do not use any checkpoint for {} model".format(args.arch), log)
 
     if args.evaluate:
-        validate(test_loader, net, criterion, log)
+        validate(test_loader, net, criterion, log, adjacency, coefficients)
         return
 
     start_time = time.time()
     epoch_time = AverageMeter()
     train_los = -1
-    
+
     for epoch in range(args.start_epoch, args.epochs):
         current_learning_rate = adjust_learning_rate(optimizer, epoch, args.gammas, args.schedule, train_los)
 
@@ -183,15 +219,16 @@ def main():
         print_log('\n==>>{:s} [Epoch={:03d}/{:03d}] {:s} [learning_rate={:6.4f}]'.format(time_string(), epoch, args.epochs, need_time, current_learning_rate) \
                     + ' [Best : Accuracy={:.2f}, Error={:.2f}]'.format(recorder.max_accuracy(False), 100-recorder.max_accuracy(False)), log)
 
-        train_acc, train_los = train(train_loader, net, criterion, optimizer, epoch, log)
+        # print(adjacency.node_features)
+        train_acc, train_los = train(train_loader, net, criterion, optimizer, epoch, log, adjacency, coefficients)
 
-        val_acc, val_los   = validate(test_loader, net, criterion, log)
+        val_acc, val_los   = validate(test_loader, net, criterion, log, adjacency, coefficients)
         recorder.update(epoch, train_los, train_acc, val_los, val_acc)
 
         is_best = False
         if val_acc > best_acc:
             is_best = True
-            best_acc = val_acc    
+            best_acc = val_acc
 
         save_checkpoint({
           'epoch': epoch + 1,
@@ -199,6 +236,8 @@ def main():
           'state_dict': net.state_dict(),
           'recorder': recorder,
           'optimizer' : optimizer.state_dict(),
+          'coefficients': coefficients,
+          'adjacency': adjacency,
         }, is_best, args.save_path, 'checkpoint.pth.tar')
 
         epoch_time.update(time.time() - start_time)
@@ -207,7 +246,7 @@ def main():
     log.close()
 
 
-def train(train_loader, model, criterion, optimizer, epoch, log):
+def train(train_loader, model, criterion, optimizer, epoch, log, adjacency, coefficients):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -220,23 +259,26 @@ def train(train_loader, model, criterion, optimizer, epoch, log):
     for i, (input, target) in enumerate(train_loader):
         data_time.update(time.time() - end)
         target = target.cuda(non_blocking=True)
-        
-        output = model(input)
+
+        tmp1, tmp2 = adjacency.sample()
+        output = model(input, adjacencies=tmp1, invalid_layerss=tmp2, coefficients=coefficients)
         loss = criterion(output, target)
-    
+
         prec1, prec5 = accuracy(output, target, topk=(1, 5))
         losses.update(loss.item(), input.size(0))
         top1.update(prec1.item(), input.size(0))
         top5.update(prec5.item(), input.size(0))
 
         optimizer.zero_grad()
-        loss.backward()
+        adjacency.nf_optimizer.zero_grad()
+        (loss + adjacency.neg_entropy()*args.entropy_weight).backward()
         optimizer.step()
+        adjacency.nf_optimizer.step()
 
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % args.print_freq == 0:
+        if i == len(train_loader) - 1: #i % args.print_freq == 0:
             print_log('  Epoch: [{:03d}][{:03d}/{:03d}]   '
                         'Time {batch_time.val:.3f} ({batch_time.avg:.3f})   '
                         'Data {data_time.val:.3f} ({data_time.avg:.3f})   '
@@ -249,7 +291,7 @@ def train(train_loader, model, criterion, optimizer, epoch, log):
     return top1.avg, losses.avg
 
 
-def validate(val_loader, model, criterion, log):
+def validate(val_loader, model, criterion, log, adjacency, coefficients):
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
@@ -260,7 +302,8 @@ def validate(val_loader, model, criterion, log):
         for i, (input, target) in enumerate(val_loader):
             target = target.cuda(non_blocking=True)
 
-            output = model(input)
+            tmp1, tmp2 = adjacency.sample(True)
+            output = model(input, adjacencies=tmp1, invalid_layerss=tmp2, coefficients=coefficients)
             loss = criterion(output, target)
 
             prec1, prec5 = accuracy(output, target, topk=(1, 5))
@@ -296,18 +339,17 @@ def adjust_learning_rate(optimizer, epoch, gammas, schedule, loss):
     return lr
 
 
-def group_weight_decay(net, weight_decay, skip_list=()):
-    decay, no_decay = [], []
+def group_weight_decay(net, weight_decay, coefficients):
+    decay = []
     for name, param in net.named_parameters():
         if not param.requires_grad: continue
-        if sum([pattern in name for pattern in skip_list]) > 0: no_decay.append(param)
-        else: decay.append(param)
-    return [{'params': no_decay, 'weight_decay': 0.}, {'params': decay, 'weight_decay': weight_decay}]
+        decay.append(param)
+    return [{'params': decay, 'weight_decay': weight_decay}] + ([{'params': coefficients, 'weight_decay': 0.}] if coefficients else [])
 
-    
+
 def accuracy(output, target, topk=(1,)):
     if len(target.shape) > 1: return torch.tensor(1), torch.tensor(1)
-    
+
     with torch.no_grad():
         maxk = max(topk)
         batch_size = target.size(0)

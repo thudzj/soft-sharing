@@ -20,8 +20,8 @@ class SConv2d(nn.Module):
         self.stride = stride
         self.padding = padding
         self.bank = bank
-        self.coefficients = nn.Parameter(torch.zeros(bank.coefficient_shape))
+        # self.coefficients = nn.Parameter(torch.zeros(bank.coefficient_shape))
 
-    def forward(self, input):
-        params = self.bank(self.coefficients)
+    def forward(self, input, coefficients):
+        params = self.bank(coefficients)
         return F.conv2d(input, params, stride=self.stride, padding=self.padding)
