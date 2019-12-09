@@ -29,7 +29,7 @@ parser.add_argument('--wide', type=int, metavar='N', default=2)
 parser.add_argument('--bank_size', type=int, default=2, help='Size of filter bank for soft shared network')
 
 # Optimization
-parser.add_argument('--epochs', metavar='N', type=int, default=250, help='Number of epochs to train.')
+parser.add_argument('--epochs', metavar='N', type=int, default=200, help='Number of epochs to train.')
 parser.add_argument('--batch_size', type=int, default=128, help='Batch size.')
 parser.add_argument('--learning_rate', type=float, default=0.1, help='The Learning Rate.')
 parser.add_argument('--momentum', type=float, default=0.9, help='Momentum.')
@@ -44,34 +44,20 @@ parser.add_argument('--cutout', dest='cutout', action='store_true', help='Enable
 parser.add_argument('--print_freq', default=200, type=int, metavar='N', help='Print frequency, minibatch-wise (default: 200)')
 parser.add_argument('--save_path', type=str, default='./snapshots/', help='Folder to save checkpoints and log.')
 parser.add_argument('--resume', default='', type=str, metavar='PATH', help='Path to latest checkpoint (default: none)')
+parser.add_argument('--load_adj', default='', type=str, metavar='PATH', help='Path to load adj (default: none)')
 parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='Manual epoch number (useful on restarts)')
 parser.add_argument('--evaluate', dest='evaluate', action='store_true', help='Evaluate model on test set')
 
 # Acceleration
-parser.add_argument('--ngpu', type=int, default=8, help='0 = CPU.')
+parser.add_argument('--ngpu', type=int, default=1, help='0 = CPU.')
 parser.add_argument('--workers', type=int, default=16, help='number of data loading workers (default: 16)')
 
 # Random seed
 parser.add_argument('--manualSeed', type=int, help='manual seed')
 parser.add_argument('--job-id', type=str, default='')
 
-# Adj setting
-# parser.add_argument('--adj_n_components', type=int, default=1, help='# of components in the mixture distribution of adj')
-# parser.add_argument('--adj_feature_dim', type=int, default=10, help='dimension of node features to build adj')
-# parser.add_argument('--adj_hard', dest='adj_hard', action='store_true', help='whether using hard adj')
-# parser.add_argument('--adj_gradient_estimator', type=str, default='gsm', help='gradient estimator to optimize adj')
-# parser.add_argument('--tau0', type=float, default=1., help='tau0')
-# parser.add_argument('--tau_min', type=float, default=1., help='tau_min')
-# parser.add_argument('--tau_anneal_rate', type=float, default=0.00003, help='tau_anneal_rate')
-parser.add_argument('--adj_lr', type=float, default=3e-3, help='learning rate for adj')
-parser.add_argument('--entropy_weight', type=float, default=1., help='entropy_weight for adj')
-parser.add_argument('--adj_update_steps_per_epoch', type=int, default=100, help='interval for updating adj rnn')
-parser.add_argument('--adj_batch_size', type=int, default=16, help='batch size for updating adj rnn')
-
 args = parser.parse_args()
 args.use_cuda = args.ngpu > 0 and torch.cuda.is_available()
-assert args.adj_batch_size % args.ngpu == 0
-os.environ['CUDA_VISIBLE_DEVICES'] = ','.join([str(i) for i in range(args.ngpu)])
 print(torch.cuda.device_count())
 job_id = args.job_id
 args.save_path = args.save_path + job_id
@@ -106,29 +92,11 @@ def load_dataset():
         test_transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
         valid_iter = None
 
-        if args.evaluate:
-            train_data = dataset(args.data_path, train=True, transform=train_transform, download=True)
-            test_data = dataset(args.data_path, train=False, transform=test_transform, download=True)
+        train_data = dataset(args.data_path, train=True, transform=train_transform, download=True)
+        test_data = dataset(args.data_path, train=False, transform=test_transform, download=True)
 
-            train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
-            test_loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
-        else:
-            # partition training set into two instead. note that test_data is defined using train=True
-            train_data = dataset(args.data_path, train=True, transform=train_transform, download=True)
-            valid_data = dataset(args.data_path, train=True, transform=test_transform, download=True)
-
-            indices = list(range(len(train_data)))
-            np.random.shuffle(indices)
-            split = int(0.9 * len(train_data))
-            train_indices, valid_indices = indices[:split], indices[split:]
-            train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, num_workers=args.workers, pin_memory=True, sampler=SubsetRandomSampler(train_indices))
-            valid_loader = torch.utils.data.DataLoader(valid_data, batch_size=args.batch_size, num_workers=args.workers, pin_memory=True, sampler=SubsetRandomSampler(valid_indices), drop_last=True)
-            valid_iter = DataIter(valid_loader)
-            # train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, num_workers=args.workers, pin_memory=True, shuffle=True)
-
-            test_data = dataset(args.data_path, train=False, transform=test_transform, download=True)
-            test_loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
-
+        train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
+        test_loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
 
     elif args.dataset == 'imagenet':
         import imagenet_seq
@@ -169,8 +137,7 @@ def main():
 
     num_classes, train_loader, valid_iter, test_loader = load_dataset()
     net = load_model(num_classes, log)
-    net_p = torch.nn.DataParallel(net, device_ids=range(args.ngpu))
-
+    net_p = None
     criterion = torch.nn.CrossEntropyLoss().cuda()
 
     if args.bank_size > 0:
@@ -187,20 +154,7 @@ def main():
         coefficients = None
     params = group_weight_decay(net, state['decay'], coefficients)
     optimizer = torch.optim.SGD(params, state['learning_rate'], momentum=state['momentum'], nesterov=(state['momentum'] > 0.0))
-
-    adjacency = RNNAdjacency(3, net.stage_1.nlayers, lr=args.adj_lr, entropy_weight=args.entropy_weight)
-    # adjacency.load()
-    # adjacency = Adjacency([net.module.stage_1.nlayers+1, net.module.stage_2.nlayers+1, net.module.stage_3.nlayers+1],
-    #                     args.adj_n_components, args.adj_feature_dim, args.tau0, args.tau_min, args.tau_anneal_rate,
-    #                     args.adj_hard, args.adj_gradient_estimator, args.adj_lr)
-    rl_schedule = {}
-    rl_seg_list = [len(train_loader) // args.adj_update_steps_per_epoch] * args.adj_update_steps_per_epoch
-    for _i in range(len(train_loader) % args.adj_update_steps_per_epoch):
-        rl_seg_list[_i] += 1
-    for j in range(1, len(rl_seg_list)):
-        rl_seg_list[j] += rl_seg_list[j - 1]
-    for j in rl_seg_list:
-        rl_schedule[j - 1] = 1
+    rl_schedule = None
 
     recorder = RecorderMeter(args.epochs)
     if args.resume:
@@ -222,6 +176,26 @@ def main():
     else:
         print_log("=> do not use any checkpoint for {} model".format(args.arch), log)
 
+    if args.load_adj:
+        if args.load_adj == "one":
+            adjacency = torch.cat([torch.zeros(1, net.stage_1.nlayers-1), torch.eye(net.stage_1.nlayers-1)]).repeat(3, 1).data.cpu()
+        elif args.load_adj == "full":
+            adjacency = torch.cat([torch.zeros(1, net.stage_1.nlayers-1), torch.ones(net.stage_1.nlayers-1,net.stage_1.nlayers-1).tril()]).repeat(3, 1).data.cpu()
+        else:
+            assert os.path.isfile(args.load_adj)
+            print_log("=> loading adj from '{}'".format(args.load_adj), log)
+            checkpoint = torch.load(args.load_adj)
+            adjacency = checkpoint['adjacency']
+            if type(adjacency) is RNNAdjacency:
+                adjacency.eval()
+                with torch.no_grad():
+                    adjacency = adjacency.sample(deterministic=True).data.cpu()
+    else:
+        exit(1)
+
+    for s in adjacency:
+        print(s.numpy())
+
     if args.evaluate:
         validate(test_loader, net, criterion, log, adjacency, coefficients)
         return
@@ -239,17 +213,10 @@ def main():
         print_log('\n==>>{:s} [Epoch={:03d}/{:03d}] {:s} [learning_rate={:6.4f}]'.format(time_string(), epoch, args.epochs, need_time, current_learning_rate) \
                     + ' [Best : Accuracy={:.2f}, Error={:.2f}]'.format(recorder.max_accuracy(False), 100-recorder.max_accuracy(False)), log)
 
-        train_acc, train_los = train(train_loader, valid_iter, net, criterion, optimizer, epoch, log, adjacency, coefficients, args.adj_batch_size, args.ngpu, rl_schedule, net_p)
+        train_acc, train_los = train(train_loader, valid_iter, net, criterion, optimizer, epoch, log, adjacency, coefficients, None, args.ngpu, rl_schedule, net_p)
 
         val_acc, val_los   = validate(test_loader, net, criterion, log, adjacency, coefficients)
         recorder.update(epoch, train_los, train_acc, val_los, val_acc)
-
-        if epoch % 5 == 0:
-            adjacency.eval()
-            with torch.no_grad():
-                samp = adjacency.sample(deterministic=True)
-            for s in samp:
-                print(s.data.cpu().numpy())
 
         is_best = False
         if val_acc > best_acc:
@@ -276,17 +243,11 @@ def train(train_loader, valid_iter, model, criterion, optimizer, epoch, log, adj
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
-    rl_time = AverageMeter()
     losses = AverageMeter()
-    ent_losses = AverageMeter()
-    rl_losses = AverageMeter()
-    rewards = AverageMeter()
-    sample_vars = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
 
     model.train()
-    adjacency.train()
 
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
@@ -294,9 +255,7 @@ def train(train_loader, valid_iter, model, criterion, optimizer, epoch, log, adj
         input = input.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
 
-        with torch.no_grad():
-            adjacencies = adjacency.sample(deterministic=False if epoch < 200 else True)
-        output = model(input, adjacencies=adjacencies, coefficients=coefficients)
+        output = model(input, adjacencies=adjacency, coefficients=coefficients)
         loss = criterion(output, target)
 
         prec1, prec5 = accuracy(output, target, topk=(1, 5))
@@ -308,46 +267,16 @@ def train(train_loader, valid_iter, model, criterion, optimizer, epoch, log, adj
         loss.backward()
         optimizer.step()
 
-        if epoch <= 2 or (epoch >= 50 and epoch < 200):
-            for j in range(rl_schedule.get(i, 0)):
-                rl_start_time = time.time()
-                adjacency.zero_grad()
-                samp = adjacency.sample(adj_batch_size)
-                sample_vars.update(sum([item[1:].tril().sum().item() for item in samp.var(0).chunk(3)])/63.)
-                with torch.no_grad():
-                    if epoch < 50:
-                        rs = torch.zeros(adj_batch_size).cuda()
-                    else:
-                        input_search, target_search = valid_iter.next_batch
-                        input_search = input_search.repeat(ngpu,1,1,1)
-                        target_search = target_search.cuda(non_blocking=True)
-                        output_search = []
-                        for k in range(adj_batch_size//ngpu):
-                            output_search.append(net_p(input_search, samp[k*ngpu:(k+1)*ngpu]))
-                        rs = torch.cat(output_search, 0).max(1)[1].eq(target_search.repeat(adj_batch_size)).view(
-                             adj_batch_size, -1).float().mean(1)
-                adjacency.step(rs, epoch)
-                rl_time.update(time.time() - rl_start_time)
-                ent_losses.update(adjacency.neg_entropy.item(), adj_batch_size)
-                rl_losses.update(adjacency.rl_loss.item(), adj_batch_size)
-                rewards.update(adjacency.avg_reward.item(), adj_batch_size)
-
         batch_time.update(time.time() - end)
         end = time.time()
         if i == len(train_loader) - 1: #i % args.print_freq == 0:
             print_log('  Epoch: [{:03d}][{:03d}/{:03d}]   '
                         'Time {batch_time.val:.3f} ({batch_time.avg:.3f})   '
-                        'RL time {rl_time.val:.3f} ({rl_time.avg:.3f})   '
                         'Loss {loss.val:.4f} ({loss.avg:.4f})   '
-                        'Reward {reward.val:.4f} ({reward.avg:.4f})   '
-                        'Sample variance {sample_var.val:.4f} ({sample_var.avg:.4f})   '
-                        'RL loss {rl_loss.val:.4f} ({rl_loss.avg:.4f})   '
-                        'Ent loss {ent_loss.val:.4f} ({ent_loss.avg:.4f})   '
                         'Prec@1 {top1.val:.3f} ({top1.avg:.3f})   '
                         'Prec@5 {top5.val:.3f} ({top5.avg:.3f})   '.format(
                         epoch, i, len(train_loader), batch_time=batch_time,
-                        rl_time=rl_time, loss=losses, reward=rewards, sample_var=sample_vars,
-                        rl_loss=rl_losses, ent_loss=ent_losses, top1=top1, top5=top5) + time_string(), log)
+                        loss=losses, top1=top1, top5=top5) + time_string(), log)
     print_log('  **Train** Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f} Error@1 {error1:.3f}'.format(top1=top1, top5=top5, error1=100-top1.avg), log)
     return top1.avg, losses.avg
 
@@ -358,14 +287,13 @@ def validate(val_loader, model, criterion, log, adjacency, coefficients):
     top5 = AverageMeter()
 
     model.eval()
-    adjacency.eval()
 
     with torch.no_grad():
         for i, (input, target) in enumerate(val_loader):
             input = input.cuda(non_blocking=True)
             target = target.cuda(non_blocking=True)
 
-            output = model(input, adjacencies=adjacency.sample(deterministic=True), coefficients=coefficients)
+            output = model(input, adjacencies=adjacency, coefficients=coefficients)
             loss = criterion(output, target)
 
             prec1, prec5 = accuracy(output, target, topk=(1, 5))

@@ -148,3 +148,19 @@ def time_file_str():
   ISOTIMEFORMAT='%Y-%m-%d'
   string = '{}'.format(time.strftime( ISOTIMEFORMAT, time.gmtime(time.time()) ))
   return string + '-{}'.format(random.randint(1, 10000))
+
+class DataIter(object):
+    def __init__(self, data_loader):
+        self.data_loader = data_loader
+        self._data_iter = None
+
+    @property
+    def next_batch(self):
+        if self._data_iter is None:
+            self._data_iter = iter(self.data_loader)
+        try:
+            data, label = next(self._data_iter)
+        except StopIteration:
+            self._data_iter = iter(self.data_loader)
+            data, label = next(self._data_iter)
+        return data, label
